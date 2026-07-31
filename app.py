@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import streamlit as st
 
 from src.imaging import ImageStudy, load_uploaded_study
-from src.modeling import get_model_status, get_simulated_demo_result
+from src.modeling import (
+    ModelUnavailableError,
+    ResearchModelResult,
+    get_model_status,
+    get_simulated_demo_result,
+    run_research_model,
+)
 from src.safety import audit_generated_report
 from src.ui import apply_theme, render_footer, render_header, render_metric_card
 
 
-APP_VERSION = "0.2.0-model-scaffold"
+APP_VERSION = "0.3.0-feature-gated-runner"
 
 
 st.set_page_config(
@@ -40,9 +48,9 @@ def render_sidebar() -> None:
         )
 
         st.markdown("---")
-        st.markdown("**Model scaffold build**")
+        st.markdown("**Feature-gated model build**")
         st.caption(f"Version {APP_VERSION}")
-        st.progress(28, text="MVP roadmap")
+        st.progress(42, text="MVP roadmap")
 
         st.markdown("### Current capabilities")
         st.markdown(
@@ -52,6 +60,7 @@ def render_sidebar() -> None:
             - Technical image QA preview
             - AI report language audit
             - Protected model interface
+            - Feature-gated real model runner
             - Simulated prediction UI
             - Privacy-first metadata display
             """
@@ -88,27 +97,63 @@ def render_empty_analysis() -> None:
     )
 
 
-def render_model_workspace() -> None:
-    model_status = get_model_status()
+def _study_key(study: ImageStudy) -> str:
+    """Create a stable session key for the currently displayed image."""
 
-    st.markdown("### Research model workspace")
+    image = np.ascontiguousarray(np.asarray(study.display_image))
+    digest = hashlib.sha256()
+    digest.update(study.file_name.encode("utf-8", errors="ignore"))
+    digest.update(str(image.shape).encode("utf-8"))
+    digest.update(str(image.dtype).encode("utf-8"))
+    digest.update(image.tobytes())
+    return digest.hexdigest()
 
-    status_col, version_col, mode_col = st.columns(3)
-    with status_col:
-        render_metric_card(
-            "Inference",
-            "Enabled" if model_status.available else "Disabled",
-        )
-    with version_col:
-        render_metric_card("Model version", model_status.version)
-    with mode_col:
-        render_metric_card("Mode", model_status.mode)
 
-    if not model_status.available:
-        st.info(
-            "No image-analysis model is connected yet. RadiantGuard will not "
-            "generate findings from the uploaded image in this build."
-        )
+def render_research_result(result: ResearchModelResult) -> None:
+    """Render a completed research-model result with explicit limitations."""
+
+    st.error(
+        "UNVALIDATED RESEARCH OUTPUT — NOT A DIAGNOSIS. "
+        "These scores are not calibrated probabilities and must not guide "
+        "treatment or replace review by a qualified physician or radiologist."
+    )
+
+    st.markdown(f"#### {result.model_name}")
+    st.caption(f"Version {result.model_version} · {result.mode}")
+
+    st.markdown("##### Highest research scores")
+
+    for prediction in result.predictions:
+        label_col, score_col = st.columns([3, 1])
+
+        with label_col:
+            st.markdown(f"**{prediction.label}**")
+            st.caption(prediction.explanation)
+
+        with score_col:
+            st.metric(
+                "Research score",
+                f"{prediction.confidence_percent}%",
+                help=(
+                    "A raw research-model score for interface comparison. "
+                    "It is not a calibrated probability or diagnostic confidence."
+                ),
+            )
+
+        st.progress(prediction.confidence_percent)
+
+    with st.expander("Required limitations", expanded=True):
+        for limitation in result.limitations:
+            st.markdown(f"- {limitation}")
+
+    if result.preprocessing:
+        with st.expander("View preprocessing record"):
+            for step in result.preprocessing:
+                st.markdown(f"- {step}")
+
+
+def render_simulated_workspace() -> None:
+    """Render the optional hard-coded interface demonstration."""
 
     show_demo = st.checkbox(
         "Show a simulated prediction-interface example",
@@ -122,7 +167,7 @@ def render_model_workspace() -> None:
     if not show_demo:
         st.caption(
             "The simulated preview is optional and remains off by default. "
-            "A documented public research model will be connected in a later phase."
+            "It does not use the uploaded image."
         )
         return
 
@@ -138,17 +183,114 @@ def render_model_workspace() -> None:
 
     for prediction in demo.predictions:
         label_col, score_col = st.columns([3, 1])
+
         with label_col:
             st.markdown(f"**Example: {prediction.label}**")
             st.caption(prediction.explanation)
+
         with score_col:
-            st.metric("Simulated score", f"{prediction.confidence_percent}%")
+            st.metric(
+                "Simulated score",
+                f"{prediction.confidence_percent}%",
+            )
 
         st.progress(prediction.confidence_percent)
 
     with st.expander("View simulated-output limitations", expanded=True):
         for limitation in demo.limitations:
             st.markdown(f"- {limitation}")
+
+
+def render_model_workspace(study: ImageStudy) -> None:
+    model_status = get_model_status()
+
+    st.markdown("### Research model workspace")
+
+    status_col, version_col, mode_col = st.columns(3)
+
+    with status_col:
+        render_metric_card(
+            "Inference",
+            "Enabled" if model_status.available else "Disabled",
+        )
+
+    with version_col:
+        render_metric_card("Model version", model_status.version)
+
+    with mode_col:
+        render_metric_card("Mode", model_status.mode)
+
+    if not model_status.available:
+        st.info(
+            "The real model runner is protected by an off-by-default feature "
+            "switch. RadiantGuard will not generate image-based scores in the "
+            "current live configuration."
+        )
+        st.caption(model_status.description)
+        render_simulated_workspace()
+        return
+
+    st.warning(
+        "A public pretrained research baseline is available in this environment. "
+        "Its output is unvalidated, non-diagnostic, and may be wrong."
+    )
+
+    acknowledged = st.checkbox(
+        "I understand these are unvalidated research scores, not a diagnosis, "
+        "and the image and output require independent physician or radiologist review.",
+        key="research_model_acknowledgement",
+    )
+
+    current_key = _study_key(study)
+
+    if st.session_state.get("research_result_key") != current_key:
+        st.session_state.pop("research_model_result", None)
+        st.session_state.pop("research_result_key", None)
+
+    run_clicked = st.button(
+        "Run unvalidated research baseline",
+        type="primary",
+        disabled=not acknowledged,
+        help=(
+            "Runs the public research model on the displayed image. "
+            "This does not provide medical advice or a diagnosis."
+        ),
+    )
+
+    if run_clicked:
+        image = np.asarray(study.display_image)
+
+        try:
+            with st.spinner(
+                "Running the CPU research baseline. "
+                "The first run may take longer while model weights load..."
+            ):
+                result = run_research_model(image)
+
+        except ModelUnavailableError as exc:
+            st.error("The protected research model is not available.")
+            st.caption(str(exc))
+
+        except Exception as exc:
+            st.error(
+                "RadiantGuard could not complete the research-model run. "
+                "No medical conclusion should be drawn from this error."
+            )
+            st.caption(str(exc))
+
+        else:
+            st.session_state["research_model_result"] = result
+            st.session_state["research_result_key"] = current_key
+
+    stored_result = st.session_state.get("research_model_result")
+    stored_key = st.session_state.get("research_result_key")
+
+    if stored_result is not None and stored_key == current_key:
+        render_research_result(stored_result)
+    else:
+        st.caption(
+            "No research inference has been run for this uploaded image."
+        )
 
 
 def render_study(study: ImageStudy) -> None:
@@ -163,7 +305,7 @@ def render_study(study: ImageStudy) -> None:
         )
         st.caption(
             "Displayed pixels are for educational review only. "
-            "No diagnostic model is connected in this build."
+            "Any research-model output is unvalidated and non-diagnostic."
         )
 
     with right:
@@ -238,7 +380,7 @@ def render_study(study: ImageStudy) -> None:
                 "and patient-ID fields from this display."
             )
 
-    render_model_workspace()
+    render_model_workspace(study)
 
 
 def render_analyze_tab() -> None:
