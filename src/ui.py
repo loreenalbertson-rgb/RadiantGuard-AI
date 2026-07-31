@@ -587,3 +587,4 @@ def render_footer(version: str) -> None:
         </div>
         """,
         unsafe_allow_html=True,
+    )
