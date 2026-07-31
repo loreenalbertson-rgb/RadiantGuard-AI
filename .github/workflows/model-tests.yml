@@ -1,0 +1,70 @@
+name: Model Compatibility Tests
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "requirements-model.txt"
+      - "model_tests/**"
+      - "src/modeling.py"
+      - ".github/workflows/model-tests.yml"
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "requirements-model.txt"
+      - "model_tests/**"
+      - "src/modeling.py"
+      - ".github/workflows/model-tests.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: Medical imaging compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-model.txt
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install foundation dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Install CPU-only PyTorch
+        run: |
+          python -m pip install \
+            torch==2.7.1 \
+            torchvision==0.22.1 \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install medical imaging dependencies
+        run: |
+          python -m pip install \
+            "monai>=1.5,<2.0" \
+            "torchxrayvision==1.5.2" \
+            pytest
+
+      - name: Verify dependency compatibility
+        run: python -m pip check
+
+      - name: Run model compatibility tests
+        run: python -m pytest model_tests -v
