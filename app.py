@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from datetime import datetime, timezone
 
 import numpy as np
 import streamlit as st
@@ -17,7 +19,7 @@ from src.safety import audit_generated_report
 from src.ui import apply_theme, render_footer, render_header, render_metric_card
 
 
-APP_VERSION = "0.3.0-feature-gated-runner"
+APP_VERSION = "0.4.0-research-reporting"
 
 
 st.set_page_config(
@@ -50,7 +52,7 @@ def render_sidebar() -> None:
         st.markdown("---")
         st.markdown("**Feature-gated model build**")
         st.caption(f"Version {APP_VERSION}")
-        st.progress(42, text="MVP roadmap")
+        st.progress(55, text="MVP roadmap")
 
         st.markdown("### Current capabilities")
         st.markdown(
@@ -61,6 +63,8 @@ def render_sidebar() -> None:
             - AI report language audit
             - Protected model interface
             - Feature-gated real model runner
+            - Source and suitability screening
+            - Downloadable research reports
             - Simulated prediction UI
             - Privacy-first metadata display
             """
@@ -109,7 +113,152 @@ def _study_key(study: ImageStudy) -> str:
     return digest.hexdigest()
 
 
-def render_research_result(result: ResearchModelResult) -> None:
+def _clean_label(label: str) -> str:
+    """Convert model labels into a cleaner display format."""
+
+    return label.replace("_", " ").strip()
+
+
+def _create_analysis_id(study_key: str, created_at: datetime) -> str:
+    """Create a reproducible-looking, non-patient analysis identifier."""
+
+    timestamp = created_at.strftime("%Y%m%dT%H%M%SZ")
+    short_hash = study_key[:8].upper()
+    return f"RG-{timestamp}-{short_hash}"
+
+
+def _assess_model_suitability(
+    image_source: str,
+    declared_image_type: str,
+) -> tuple[str, str, tuple[str, ...]]:
+    """Assess whether an upload fits this baseline's narrow research scope.
+
+    This is a workflow check based only on user-declared source and image type.
+    It is not an image interpretation or clinical-quality assessment.
+    """
+
+    notes: list[str] = []
+
+    if declared_image_type != "Frontal chest X-ray (PA or AP)":
+        return (
+            "Outside intended baseline",
+            "Do not run",
+            (
+                "This baseline was selected for frontal chest radiographs.",
+                "The declared image type is outside its intended research input.",
+                "No model run should be treated as meaningful for this image type.",
+            ),
+        )
+
+    if image_source == "AI-generated or synthetic demo":
+        notes.extend(
+            (
+                "Synthetic textures may produce arbitrary or misleading model scores.",
+                "This source is useful only for software and interface testing.",
+            )
+        )
+        return "Limited demo suitability", "High caution", tuple(notes)
+
+    if image_source == "De-identified public research dataset":
+        notes.extend(
+            (
+                "Dataset provenance and licensing should be documented separately.",
+                "Research scores may still reflect dataset-specific bias.",
+            )
+        )
+        return "Research-only eligible", "Caution", tuple(notes)
+
+    if image_source == "De-identified educational sample":
+        notes.extend(
+            (
+                "The sample's provenance and intended teaching use should be verified.",
+                "Research scores remain unvalidated and non-diagnostic.",
+            )
+        )
+        return "Research-only eligible", "Caution", tuple(notes)
+
+    notes.extend(
+        (
+            "The source and acquisition context are not sufficiently documented.",
+            "Unknown provenance increases out-of-distribution and privacy risk.",
+        )
+    )
+    return "Uncertain suitability", "High caution", tuple(notes)
+
+
+def _build_research_report(
+    *,
+    result: ResearchModelResult,
+    study: ImageStudy,
+    image_source: str,
+    declared_image_type: str,
+    suitability: str,
+    caution_level: str,
+    suitability_notes: tuple[str, ...],
+    analysis_id: str,
+    created_at: str,
+) -> dict[str, object]:
+    """Build a machine-readable, non-diagnostic research report."""
+
+    return {
+        "report_type": "RadiantGuard AI unvalidated research report",
+        "analysis_id": analysis_id,
+        "created_at_utc": created_at,
+        "application_version": APP_VERSION,
+        "clinical_status": (
+            "Educational research output only. Not a diagnosis, medical device, "
+            "or substitute for physician or radiologist review."
+        ),
+        "input": {
+            "file_name": study.file_name,
+            "file_format": study.file_format,
+            "dimensions": {
+                "width": study.width,
+                "height": study.height,
+            },
+            "declared_image_source": image_source,
+            "declared_image_type": declared_image_type,
+            "displayed_modality_metadata": study.metadata.get(
+                "Modality",
+                "Not provided",
+            ),
+            "displayed_view_metadata": study.metadata.get(
+                "View Position",
+                "Not provided",
+            ),
+        },
+        "suitability_screen": {
+            "status": suitability,
+            "caution_level": caution_level,
+            "basis": (
+                "User-declared source and image type only; "
+                "not image interpretation."
+            ),
+            "notes": list(suitability_notes),
+        },
+        "model": {
+            "name": result.model_name,
+            "version": result.model_version,
+            "mode": result.mode,
+        },
+        "research_scores": [
+            {
+                "label": _clean_label(prediction.label),
+                "raw_score": round(float(prediction.confidence), 6),
+                "display_score_percent": prediction.confidence_percent,
+                "interpretation_boundary": prediction.explanation,
+            }
+            for prediction in result.predictions
+        ],
+        "preprocessing": list(result.preprocessing),
+        "required_limitations": list(result.limitations),
+    }
+
+
+def render_research_result(
+    result: ResearchModelResult,
+    report: dict[str, object],
+) -> None:
     """Render a completed research-model result with explicit limitations."""
 
     st.error(
@@ -118,6 +267,10 @@ def render_research_result(result: ResearchModelResult) -> None:
         "treatment or replace review by a qualified physician or radiologist."
     )
 
+    report_col, time_col = st.columns(2)
+    report_col.caption(f"Analysis ID: {report['analysis_id']}")
+    time_col.caption(f"Created: {report['created_at_utc']}")
+
     st.markdown(f"#### {result.model_name}")
     st.caption(f"Version {result.model_version} · {result.mode}")
 
@@ -125,9 +278,10 @@ def render_research_result(result: ResearchModelResult) -> None:
 
     for prediction in result.predictions:
         label_col, score_col = st.columns([3, 1])
+        clean_label = _clean_label(prediction.label)
 
         with label_col:
-            st.markdown(f"**{prediction.label}**")
+            st.markdown(f"**{clean_label}**")
             st.caption(prediction.explanation)
 
         with score_col:
@@ -150,6 +304,28 @@ def render_research_result(result: ResearchModelResult) -> None:
         with st.expander("View preprocessing record"):
             for step in result.preprocessing:
                 st.markdown(f"- {step}")
+
+    report_json = json.dumps(
+        report,
+        indent=2,
+        ensure_ascii=False,
+    )
+
+    st.download_button(
+        "Download research report (JSON)",
+        data=report_json,
+        file_name=f"{report['analysis_id']}.json",
+        mime="application/json",
+        help=(
+            "Downloads scores, model version, preprocessing, source declaration, "
+            "suitability screening, and required limitations. No image pixels are included."
+        ),
+    )
+
+    st.caption(
+        "The downloaded report contains no image pixels and should not be "
+        "placed in a medical record or used for clinical decisions."
+    )
 
 
 def render_simulated_workspace() -> None:
@@ -235,6 +411,70 @@ def render_model_workspace(study: ImageStudy) -> None:
         "Its output is unvalidated, non-diagnostic, and may be wrong."
     )
 
+    st.markdown("#### Source and suitability screen")
+
+    source_col, type_col = st.columns(2)
+
+    with source_col:
+        image_source = st.selectbox(
+            "Image source",
+            options=[
+                "AI-generated or synthetic demo",
+                "De-identified public research dataset",
+                "De-identified educational sample",
+                "Other or unknown source",
+            ],
+            key="research_image_source",
+            help=(
+                "Choose the best description of the image's provenance. "
+                "Never upload identifiable patient data."
+            ),
+        )
+
+    with type_col:
+        declared_image_type = st.selectbox(
+            "Declared image type",
+            options=[
+                "Frontal chest X-ray (PA or AP)",
+                "Lateral chest X-ray",
+                "CT, MRI, ultrasound, or other modality",
+                "Unknown",
+            ],
+            key="research_declared_image_type",
+            help=(
+                "This is a user declaration for model-scope screening. "
+                "RadiantGuard is not verifying anatomy or modality here."
+            ),
+        )
+
+    suitability, caution_level, suitability_notes = _assess_model_suitability(
+        image_source,
+        declared_image_type,
+    )
+
+    suitability_col, caution_col = st.columns(2)
+    with suitability_col:
+        render_metric_card("Suitability", suitability)
+    with caution_col:
+        render_metric_card("Caution level", caution_level)
+
+    for note in suitability_notes:
+        st.info(note)
+
+    if image_source == "AI-generated or synthetic demo":
+        st.error(
+            "SYNTHETIC DEMO IMAGE: Scores may reflect artificial textures and "
+            "must not be interpreted as evidence of any medical finding."
+        )
+
+    outside_scope = declared_image_type != "Frontal chest X-ray (PA or AP)"
+
+    if outside_scope:
+        st.error(
+            "The declared image type is outside this model's intended research scope. "
+            "Inference is disabled for this upload."
+        )
+
     acknowledged = st.checkbox(
         "I understand these are unvalidated research scores, not a diagnosis, "
         "and the image and output require independent physician or radiologist review.",
@@ -242,15 +482,21 @@ def render_model_workspace(study: ImageStudy) -> None:
     )
 
     current_key = _study_key(study)
+    result_context_key = (
+        current_key,
+        image_source,
+        declared_image_type,
+    )
 
-    if st.session_state.get("research_result_key") != current_key:
+    if st.session_state.get("research_result_context") != result_context_key:
         st.session_state.pop("research_model_result", None)
-        st.session_state.pop("research_result_key", None)
+        st.session_state.pop("research_model_report", None)
+        st.session_state.pop("research_result_context", None)
 
     run_clicked = st.button(
         "Run unvalidated research baseline",
         type="primary",
-        disabled=not acknowledged,
+        disabled=(not acknowledged or outside_scope),
         help=(
             "Runs the public research model on the displayed image. "
             "This does not provide medical advice or a diagnosis."
@@ -279,17 +525,40 @@ def render_model_workspace(study: ImageStudy) -> None:
             st.caption(str(exc))
 
         else:
+            created_at = datetime.now(timezone.utc)
+            created_at_text = created_at.isoformat().replace("+00:00", "Z")
+            analysis_id = _create_analysis_id(current_key, created_at)
+
+            report = _build_research_report(
+                result=result,
+                study=study,
+                image_source=image_source,
+                declared_image_type=declared_image_type,
+                suitability=suitability,
+                caution_level=caution_level,
+                suitability_notes=suitability_notes,
+                analysis_id=analysis_id,
+                created_at=created_at_text,
+            )
+
             st.session_state["research_model_result"] = result
-            st.session_state["research_result_key"] = current_key
+            st.session_state["research_model_report"] = report
+            st.session_state["research_result_context"] = result_context_key
 
     stored_result = st.session_state.get("research_model_result")
-    stored_key = st.session_state.get("research_result_key")
+    stored_report = st.session_state.get("research_model_report")
+    stored_context = st.session_state.get("research_result_context")
 
-    if stored_result is not None and stored_key == current_key:
-        render_research_result(stored_result)
+    if (
+        stored_result is not None
+        and stored_report is not None
+        and stored_context == result_context_key
+    ):
+        render_research_result(stored_result, stored_report)
     else:
         st.caption(
-            "No research inference has been run for this uploaded image."
+            "No research inference has been run for this uploaded image "
+            "and declared source context."
         )
 
 
