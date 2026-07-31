@@ -1,0 +1,22 @@
+[theme]
+base = "dark"
+primaryColor = "#48A9FF"
+backgroundColor = "#020711"
+secondaryBackgroundColor = "#0A2038"
+textColor = "#EDFAFF"
+linkColor = "#77E9FF"
+borderColor = "#24658F"
+showWidgetBorder = true
+baseRadius = "large"
+buttonRadius = "large"
+
+[theme.sidebar]
+primaryColor = "#77E9FF"
+backgroundColor = "#030B17"
+secondaryBackgroundColor = "#0A2038"
+textColor = "#E8F8FF"
+linkColor = "#77E9FF"
+borderColor = "#194A6A"
+showWidgetBorder = true
+baseRadius = "large"
+buttonRadius = "large"
