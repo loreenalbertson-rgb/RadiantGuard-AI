@@ -1,201 +1,120 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
+import pytest
 
-from src.modeling import (
-    ModelUnavailableError,
-    _INFERENCE_LOCK,
-    _load_model,
-    _preprocess_image,
-    _validate_image,
-    get_model_status,
+from src.explainability import (
+    ExplainabilityError,
+    _normalize_heatmap,
+    generate_gradcam,
 )
 
 
-class ExplainabilityError(RuntimeError):
-    """Raised when an explainability map cannot be generated safely."""
-
-
-@dataclass(frozen=True)
-class ExplainabilityResult:
-    """A non-diagnostic model-influence visualization."""
-
-    label: str
-    research_score: float
-    heatmap: np.ndarray
-    method: str
-    target_layer: str
-    preprocessing: tuple[str, ...]
-    limitations: tuple[str, ...]
-
-    @property
-    def research_score_percent(self) -> int:
-        bounded = min(max(float(self.research_score), 0.0), 1.0)
-        return round(bounded * 100)
-
-
-def _normalize_heatmap(heatmap: np.ndarray) -> np.ndarray:
-    """Normalize a two-dimensional heatmap to the range 0–1."""
-
-    array = np.asarray(heatmap, dtype=np.float32)
-
-    if array.ndim != 2:
-        raise ExplainabilityError(
-            "The explainability heatmap must be two-dimensional."
-        )
-
-    if not np.isfinite(array).all():
-        raise ExplainabilityError(
-            "The explainability heatmap contains non-finite values."
-        )
-
-    minimum = float(array.min())
-    maximum = float(array.max())
-
-    if maximum <= minimum:
-        return np.zeros_like(array, dtype=np.float32)
-
-    normalized = (array - minimum) / (maximum - minimum)
-    return np.clip(normalized, 0.0, 1.0).astype(np.float32)
-
-
-def generate_gradcam(
-    image: np.ndarray,
-    target_label: str,
-) -> ExplainabilityResult:
-    """Generate a Grad-CAM model-influence map for one research label.
-
-    The map shows which final convolutional features most influenced the
-    selected model output. It does not establish disease location, anatomy,
-    causality, clinical relevance, or correctness.
-    """
-
-    validated = _validate_image(image)
-    status = get_model_status()
-
-    if not status.available:
-        raise ModelUnavailableError(status.description)
-
-    if not isinstance(target_label, str) or not target_label.strip():
-        raise ValueError("A non-empty target label is required.")
-
-    import torch
-    import torch.nn.functional as functional
-
-    tensor, preprocessing = _preprocess_image(validated)
-    model = _load_model()
-
-    if target_label not in model.pathologies:
-        raise ValueError(
-            f"Unknown target label: {target_label!r}. "
-            "Choose a label returned by the connected research model."
-        )
-
-    target_index = model.pathologies.index(target_label)
-
-    try:
-        target_layer = model.features.norm5
-    except AttributeError as exc:
-        raise ExplainabilityError(
-            "The connected model does not expose the expected final "
-            "DenseNet feature layer."
-        ) from exc
-
-    captured: dict[str, object] = {}
-
-    def capture_activation(_module, _inputs, output) -> None:
-        captured["activation"] = output
-
-        def capture_gradient(gradient) -> None:
-            captured["gradient"] = gradient
-
-        output.register_hook(capture_gradient)
-
-    hook_handle = target_layer.register_forward_hook(capture_activation)
-
-    try:
-        with _INFERENCE_LOCK:
-            model.zero_grad(set_to_none=True)
-
-            with torch.enable_grad():
-                outputs = model(tensor)
-
-                if outputs.ndim != 2 or outputs.shape[0] != 1:
-                    raise ExplainabilityError(
-                        f"Unexpected model output shape: {tuple(outputs.shape)}"
-                    )
-
-                selected_score = outputs[0, target_index]
-
-                if not torch.isfinite(selected_score):
-                    raise ExplainabilityError(
-                        "The selected model output is not finite."
-                    )
-
-                selected_score.backward()
-
-    finally:
-        hook_handle.remove()
-
-    activation = captured.get("activation")
-    gradient = captured.get("gradient")
-
-    if activation is None or gradient is None:
-        raise ExplainabilityError(
-            "The model did not expose the activations and gradients "
-            "required for Grad-CAM."
-        )
-
-    activation_tensor = activation.detach()[0]
-    gradient_tensor = gradient.detach()[0]
-
-    if activation_tensor.ndim != 3 or gradient_tensor.ndim != 3:
-        raise ExplainabilityError(
-            "Unexpected activation or gradient dimensions."
-        )
-
-    if activation_tensor.shape != gradient_tensor.shape:
-        raise ExplainabilityError(
-            "Activation and gradient shapes do not match."
-        )
-
-    channel_weights = gradient_tensor.mean(
-        dim=(1, 2),
-        keepdim=True,
+def test_heatmap_normalization_produces_zero_to_one_values() -> None:
+    heatmap = np.array(
+        [
+            [2.0, 4.0],
+            [6.0, 10.0],
+        ],
+        dtype=np.float32,
     )
 
-    coarse_map = torch.relu(
-        (channel_weights * activation_tensor).sum(dim=0)
+    normalized = _normalize_heatmap(heatmap)
+
+    assert normalized.shape == (2, 2)
+    assert normalized.dtype == np.float32
+    assert np.isfinite(normalized).all()
+    assert normalized.min() == pytest.approx(0.0)
+    assert normalized.max() == pytest.approx(1.0)
+
+
+def test_uniform_heatmap_normalizes_to_zero() -> None:
+    heatmap = np.full(
+        (8, 8),
+        fill_value=5.0,
+        dtype=np.float32,
     )
 
-    resized_map = functional.interpolate(
-        coarse_map[None, None, ...],
-        size=(tensor.shape[-2], tensor.shape[-1]),
-        mode="bilinear",
-        align_corners=False,
-    )[0, 0]
+    normalized = _normalize_heatmap(heatmap)
 
-    heatmap = _normalize_heatmap(
-        resized_map.detach().cpu().numpy()
+    assert normalized.shape == (8, 8)
+    assert np.count_nonzero(normalized) == 0
+
+
+def test_invalid_heatmap_dimensions_are_rejected() -> None:
+    with pytest.raises(ExplainabilityError):
+        _normalize_heatmap(
+            np.zeros((1, 2, 3), dtype=np.float32)
+        )
+
+
+def test_non_finite_heatmap_is_rejected() -> None:
+    heatmap = np.zeros((4, 4), dtype=np.float32)
+    heatmap[0, 0] = np.nan
+
+    with pytest.raises(ExplainabilityError):
+        _normalize_heatmap(heatmap)
+
+
+def test_real_gradcam_runs_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "RADIANTGUARD_ENABLE_RESEARCH_MODEL",
+        "true",
     )
 
-    limitations = (
-        "This Grad-CAM map visualizes model influence, not confirmed disease location.",
-        "A highlighted region does not prove that the model used medically valid evidence.",
-        "The map may emphasize artifacts, borders, text markers, positioning, or synthetic texture.",
-        "Grad-CAM is low resolution and depends on the selected layer and model architecture.",
-        "The model score and heatmap may both be wrong, unstable, or dataset-specific.",
-        "The image, score, and visualization require independent physician or radiologist review.",
+    image = np.linspace(
+        0,
+        255,
+        224 * 224,
+        dtype=np.float32,
+    ).reshape(224, 224)
+
+    result = generate_gradcam(
+        image=image,
+        target_label="Pneumonia",
     )
 
-    return ExplainabilityResult(
-        label=target_label,
-        research_score=float(selected_score.detach().cpu().item()),
-        heatmap=heatmap,
-        method="Grad-CAM",
-        target_layer="features.norm5",
-        preprocessing=preprocessing,
-        limitations=limitations,
+    assert result.label == "Pneumonia"
+    assert result.method == "Grad-CAM"
+    assert result.target_layer == "features.norm5"
+
+    assert result.heatmap.shape == (224, 224)
+    assert result.heatmap.dtype == np.float32
+    assert np.isfinite(result.heatmap).all()
+    assert result.heatmap.min() >= 0.0
+    assert result.heatmap.max() <= 1.0
+
+    assert np.isfinite(result.research_score)
+    assert 0 <= result.research_score_percent <= 100
+
+    assert any(
+        "model influence" in limitation.lower()
+        for limitation in result.limitations
     )
+
+    assert any(
+        "not confirmed disease location" in limitation.lower()
+        for limitation in result.limitations
+    )
+
+
+def test_gradcam_rejects_unknown_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "RADIANTGUARD_ENABLE_RESEARCH_MODEL",
+        "true",
+    )
+
+    image = np.zeros(
+        (224, 224),
+        dtype=np.uint8,
+    )
+
+    with pytest.raises(ValueError, match="Unknown target label"):
+        generate_gradcam(
+            image=image,
+            target_label="Not A Real Model Label",
+        )
