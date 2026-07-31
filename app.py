@@ -99,9 +99,24 @@ def render_study(study: ImageStudy) -> None:
 
         st.markdown("#### Technical quality preview")
         q1, q2, q3 = st.columns(3)
-        q1.metric("Brightness", f"{study.quality.brightness_score:.0f}/100")
-        q2.metric("Contrast", f"{study.quality.contrast_score:.0f}/100")
-        q3.metric("Detail", f"{study.quality.detail_score:.0f}/100")
+
+with q1:
+    render_metric_card(
+        "Brightness",
+        f"{study.quality.brightness_score:.0f}/100",
+    )
+
+with q2:
+    render_metric_card(
+        "Contrast",
+        f"{study.quality.contrast_score:.0f}/100",
+    )
+
+with q3:
+    render_metric_card(
+        "Detail",
+        f"{study.quality.detail_score:.0f}/100",
+    )
 
         if study.quality.messages:
             for message in study.quality.messages:
