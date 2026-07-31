@@ -7,6 +7,11 @@ from datetime import datetime, timezone
 import numpy as np
 import streamlit as st
 
+from src.explainability import (
+    ExplainabilityError,
+    ExplainabilityResult,
+    generate_gradcam,
+)
 from src.imaging import ImageStudy, load_uploaded_study
 from src.modeling import (
     ModelUnavailableError,
@@ -14,12 +19,13 @@ from src.modeling import (
     get_model_status,
     get_simulated_demo_result,
     run_research_model,
+    _preprocess_image,
 )
 from src.safety import audit_generated_report
 from src.ui import apply_theme, render_footer, render_header, render_metric_card
 
 
-APP_VERSION = "0.4.0-research-reporting"
+APP_VERSION = "0.5.0-gradcam-explainability"
 
 
 st.set_page_config(
@@ -52,7 +58,7 @@ def render_sidebar() -> None:
         st.markdown("---")
         st.markdown("**Feature-gated model build**")
         st.caption(f"Version {APP_VERSION}")
-        st.progress(55, text="MVP roadmap")
+        st.progress(70, text="MVP roadmap")
 
         st.markdown("### Current capabilities")
         st.markdown(
@@ -65,6 +71,8 @@ def render_sidebar() -> None:
             - Feature-gated real model runner
             - Source and suitability screening
             - Downloadable research reports
+            - Grad-CAM model-influence maps
+            - Adjustable blue X-ray overlays
             - Simulated prediction UI
             - Privacy-first metadata display
             """
@@ -255,11 +263,351 @@ def _build_research_report(
     }
 
 
+
+def _model_input_preview(image: np.ndarray) -> np.ndarray:
+    """Return the exact 224×224 grayscale image supplied to the model."""
+
+    tensor, _ = _preprocess_image(image)
+    normalized = tensor[0, 0].detach().cpu().numpy().astype(np.float32)
+
+    # TorchXRayVision normalization maps display pixels from 0–255
+    # into approximately -1024–1024. Reverse that mapping for display.
+    preview = ((normalized + 1024.0) / 2048.0) * 255.0
+    return np.clip(preview, 0.0, 255.0).astype(np.uint8)
+
+
+def _thresholded_influence(
+    heatmap: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """Suppress weaker values and rescale the remaining influence to 0–1."""
+
+    clipped = np.clip(
+        np.asarray(heatmap, dtype=np.float32),
+        0.0,
+        1.0,
+    )
+
+    threshold = min(max(float(threshold), 0.0), 0.95)
+    denominator = max(1.0 - threshold, 1e-6)
+
+    return np.clip(
+        (clipped - threshold) / denominator,
+        0.0,
+        1.0,
+    )
+
+
+def _blue_glow_heatmap(
+    heatmap: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """Convert a normalized influence map into an icy blue RGB image."""
+
+    influence = _thresholded_influence(heatmap, threshold)
+    glow = np.power(influence, 0.72)
+
+    red = 2.0 + (72.0 * glow)
+    green = 9.0 + (220.0 * glow)
+    blue = 28.0 + (227.0 * glow)
+
+    rgb = np.stack((red, green, blue), axis=-1)
+    return np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+
+
+def _blue_glow_overlay(
+    base_image: np.ndarray,
+    heatmap: np.ndarray,
+    opacity: float,
+    threshold: float,
+) -> np.ndarray:
+    """Blend the blue influence map onto the exact model-space input."""
+
+    base = np.asarray(base_image, dtype=np.uint8)
+
+    if base.ndim != 2:
+        raise ValueError("The model-space preview must be grayscale.")
+
+    base_rgb = np.repeat(base[..., None], 3, axis=2).astype(np.float32)
+    heat_rgb = _blue_glow_heatmap(heatmap, threshold).astype(np.float32)
+    influence = _thresholded_influence(heatmap, threshold)
+
+    opacity = min(max(float(opacity), 0.0), 1.0)
+    alpha = (opacity * np.power(influence, 0.68))[..., None]
+
+    overlay = (base_rgb * (1.0 - alpha)) + (heat_rgb * alpha)
+    return np.clip(overlay, 0.0, 255.0).astype(np.uint8)
+
+
+def _add_explainability_to_report(
+    report: dict[str, object],
+    record: dict[str, object] | None,
+) -> dict[str, object]:
+    """Add explainability metadata without embedding image pixels."""
+
+    enriched = json.loads(json.dumps(report))
+
+    if record is None:
+        enriched["explainability"] = {
+            "status": "not generated",
+            "interpretation_boundary": (
+                "No model-influence map was generated for this analysis."
+            ),
+        }
+        return enriched
+
+    result = record["result"]
+
+    if not isinstance(result, ExplainabilityResult):
+        raise TypeError("Unexpected explainability result type.")
+
+    heatmap = np.ascontiguousarray(result.heatmap, dtype=np.float32)
+    heatmap_digest = hashlib.sha256(heatmap.tobytes()).hexdigest()
+
+    enriched["explainability"] = {
+        "status": "generated",
+        "generated_at_utc": record["created_at_utc"],
+        "selected_label": _clean_label(result.label),
+        "selected_model_label": result.label,
+        "selected_raw_research_score": round(
+            float(result.research_score),
+            6,
+        ),
+        "selected_display_score_percent": result.research_score_percent,
+        "method": result.method,
+        "target_layer": result.target_layer,
+        "heatmap_shape": list(heatmap.shape),
+        "heatmap_value_range": [
+            round(float(heatmap.min()), 6),
+            round(float(heatmap.max()), 6),
+        ],
+        "heatmap_sha256": heatmap_digest,
+        "heatmap_pixels_embedded": False,
+        "interpretation_boundary": (
+            "The heatmap visualizes model influence in model space. "
+            "It does not confirm disease location, anatomy, causality, "
+            "clinical relevance, or model correctness."
+        ),
+        "limitations": list(result.limitations),
+    }
+
+    return enriched
+
+
+def render_explainability_workspace(
+    *,
+    result: ResearchModelResult,
+    study: ImageStudy,
+    report: dict[str, object],
+) -> dict[str, object]:
+    """Render the Grad-CAM lab and return a report enriched with its metadata."""
+
+    st.markdown("### Explainability lab")
+    st.error(
+        "MODEL-INFLUENCE MAP — NOT DISEASE LOCALIZATION. "
+        "A bright region only shows what influenced the selected model output. "
+        "It may reflect anatomy, artifacts, borders, markers, positioning, "
+        "or synthetic texture rather than medically valid evidence."
+    )
+
+    available_labels = [
+        prediction.label
+        for prediction in result.predictions
+    ]
+
+    target_label = st.selectbox(
+        "Research label to explore",
+        options=available_labels,
+        format_func=_clean_label,
+        key=f"gradcam_label_{report['analysis_id']}",
+        help=(
+            "Choose one of the displayed model labels. The visualization "
+            "does not determine whether that finding is truly present."
+        ),
+    )
+
+    st.caption(
+        "Grad-CAM is generated from the model's final DenseNet feature layer. "
+        "It is a model-behavior visualization, not a radiology annotation."
+    )
+
+    record_key = f"{report['analysis_id']}::{target_label}"
+    records = st.session_state.setdefault(
+        "gradcam_records",
+        {},
+    )
+
+    generate_clicked = st.button(
+        "Generate blue model-influence map",
+        key=f"gradcam_run_{report['analysis_id']}",
+        help=(
+            "Runs a forward and backward pass for the selected research label."
+        ),
+    )
+
+    if generate_clicked:
+        try:
+            with st.spinner(
+                "Generating the Grad-CAM influence map on CPU..."
+            ):
+                explanation = generate_gradcam(
+                    image=np.asarray(study.display_image),
+                    target_label=target_label,
+                )
+
+        except (ModelUnavailableError, ExplainabilityError, ValueError) as exc:
+            st.error(
+                "RadiantGuard could not generate the model-influence map."
+            )
+            st.caption(str(exc))
+
+        except Exception as exc:
+            st.error(
+                "An unexpected explainability error occurred. "
+                "No medical conclusion should be drawn from this failure."
+            )
+            st.caption(str(exc))
+
+        else:
+            records[record_key] = {
+                "result": explanation,
+                "created_at_utc": (
+                    datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
+            }
+            st.session_state["gradcam_records"] = records
+
+    record = records.get(record_key)
+
+    if record is None:
+        st.info(
+            "No model-influence map has been generated for this label."
+        )
+        return _add_explainability_to_report(report, None)
+
+    explanation = record["result"]
+
+    if not isinstance(explanation, ExplainabilityResult):
+        st.error("The stored explainability result is invalid.")
+        return _add_explainability_to_report(report, None)
+
+    control_one, control_two = st.columns(2)
+
+    with control_one:
+        opacity_percent = st.slider(
+            "Overlay glow strength",
+            min_value=10,
+            max_value=90,
+            value=58,
+            step=2,
+            key=f"gradcam_opacity_{record_key}",
+        )
+
+    with control_two:
+        threshold_percent = st.slider(
+            "Suppress weaker influence",
+            min_value=0,
+            max_value=80,
+            value=18,
+            step=2,
+            key=f"gradcam_threshold_{record_key}",
+            help=(
+                "Raises the display threshold only. "
+                "It does not change the model or its research score."
+            ),
+        )
+
+    model_input = _model_input_preview(
+        np.asarray(study.display_image)
+    )
+
+    threshold = threshold_percent / 100.0
+    heatmap_rgb = _blue_glow_heatmap(
+        explanation.heatmap,
+        threshold,
+    )
+    overlay = _blue_glow_overlay(
+        model_input,
+        explanation.heatmap,
+        opacity_percent / 100.0,
+        threshold,
+    )
+
+    metric_one, metric_two, metric_three = st.columns(3)
+
+    with metric_one:
+        render_metric_card(
+            "Selected label",
+            _clean_label(explanation.label),
+        )
+
+    with metric_two:
+        render_metric_card(
+            "Research score",
+            f"{explanation.research_score_percent}%",
+        )
+
+    with metric_three:
+        render_metric_card(
+            "Method",
+            explanation.method,
+        )
+
+    original_col, heatmap_col, overlay_col = st.columns(3)
+
+    with original_col:
+        st.markdown("#### Model-space input")
+        st.image(
+            model_input,
+            caption="Exact 224 × 224 image received by the model",
+            use_container_width=True,
+        )
+
+    with heatmap_col:
+        st.markdown("#### Blue influence map")
+        st.image(
+            heatmap_rgb,
+            caption="Display-colored Grad-CAM values",
+            use_container_width=True,
+        )
+
+    with overlay_col:
+        st.markdown("#### Adjustable overlay")
+        st.image(
+            overlay,
+            caption="Influence map blended in model space",
+            use_container_width=True,
+        )
+
+    st.warning(
+        "The model-space images above reflect center cropping and resizing. "
+        "They are not full-resolution radiology images, and the highlighted "
+        "region must not be interpreted as a confirmed abnormality."
+    )
+
+    with st.expander(
+        "Explainability limitations",
+        expanded=True,
+    ):
+        for limitation in explanation.limitations:
+            st.markdown(f"- {limitation}")
+
+    st.caption(
+        f"Generated: {record['created_at_utc']} · "
+        f"Target layer: {explanation.target_layer}"
+    )
+
+    return _add_explainability_to_report(report, record)
+
+
 def render_research_result(
     result: ResearchModelResult,
     report: dict[str, object],
+    study: ImageStudy,
 ) -> None:
-    """Render a completed research-model result with explicit limitations."""
+    """Render research results, explainability, and a reproducible report."""
 
     st.error(
         "UNVALIDATED RESEARCH OUTPUT — NOT A DIAGNOSIS. "
@@ -296,7 +644,13 @@ def render_research_result(
 
         st.progress(prediction.confidence_percent)
 
-    with st.expander("Required limitations", expanded=True):
+    enriched_report = render_explainability_workspace(
+        result=result,
+        study=study,
+        report=report,
+    )
+
+    with st.expander("Required model limitations", expanded=True):
         for limitation in result.limitations:
             st.markdown(f"- {limitation}")
 
@@ -306,7 +660,7 @@ def render_research_result(
                 st.markdown(f"- {step}")
 
     report_json = json.dumps(
-        report,
+        enriched_report,
         indent=2,
         ensure_ascii=False,
     )
@@ -318,13 +672,14 @@ def render_research_result(
         mime="application/json",
         help=(
             "Downloads scores, model version, preprocessing, source declaration, "
-            "suitability screening, and required limitations. No image pixels are included."
+            "suitability screening, explainability metadata, and required limitations. "
+            "No image or heatmap pixels are included."
         ),
     )
 
     st.caption(
-        "The downloaded report contains no image pixels and should not be "
-        "placed in a medical record or used for clinical decisions."
+        "The downloaded report contains no image or heatmap pixels and should "
+        "not be placed in a medical record or used for clinical decisions."
     )
 
 
@@ -492,6 +847,7 @@ def render_model_workspace(study: ImageStudy) -> None:
         st.session_state.pop("research_model_result", None)
         st.session_state.pop("research_model_report", None)
         st.session_state.pop("research_result_context", None)
+        st.session_state.pop("gradcam_records", None)
 
     run_clicked = st.button(
         "Run unvalidated research baseline",
@@ -554,7 +910,7 @@ def render_model_workspace(study: ImageStudy) -> None:
         and stored_report is not None
         and stored_context == result_context_key
     ):
-        render_research_result(stored_result, stored_report)
+        render_research_result(stored_result, stored_report, study)
     else:
         st.caption(
             "No research inference has been run for this uploaded image "
