@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
+from io import BytesIO
 
 import numpy as np
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
 
 from src.explainability import (
     ExplainabilityError,
@@ -25,7 +27,7 @@ from src.safety import audit_generated_report
 from src.ui import apply_theme, render_footer, render_header, render_metric_card
 
 
-APP_VERSION = "0.5.0-gradcam-explainability"
+APP_VERSION = "0.6.0-explainability-export"
 
 
 st.set_page_config(
@@ -58,7 +60,7 @@ def render_sidebar() -> None:
         st.markdown("---")
         st.markdown("**Feature-gated model build**")
         st.caption(f"Version {APP_VERSION}")
-        st.progress(70, text="MVP roadmap")
+        st.progress(78, text="MVP roadmap")
 
         st.markdown("### Current capabilities")
         st.markdown(
@@ -73,6 +75,7 @@ def render_sidebar() -> None:
             - Downloadable research reports
             - Grad-CAM model-influence maps
             - Adjustable blue X-ray overlays
+            - Downloadable explainability graphics
             - Simulated prediction UI
             - Privacy-first metadata display
             """
@@ -339,6 +342,427 @@ def _blue_glow_overlay(
     return np.clip(overlay, 0.0, 255.0).astype(np.uint8)
 
 
+
+def _load_export_font(
+    size: int,
+    *,
+    bold: bool = False,
+) -> ImageFont.ImageFont:
+    """Load a bundled Linux font when available, with a safe fallback."""
+
+    candidates = (
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        ),
+        (
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/dejavu/DejaVuSans.ttf"
+        ),
+    )
+
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
+
+    return ImageFont.load_default()
+
+
+def _wrap_export_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> list[str]:
+    """Wrap text to a pixel width for the generated PNG."""
+
+    words = str(text).split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
+    current = words[0]
+
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        left, top, right, bottom = draw.textbbox(
+            (0, 0),
+            candidate,
+            font=font,
+        )
+
+        if right - left <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+
+    lines.append(current)
+    return lines
+
+
+def _draw_wrapped_export_text(
+    draw: ImageDraw.ImageDraw,
+    *,
+    position: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+    max_width: int,
+    line_spacing: int = 8,
+) -> int:
+    """Draw wrapped text and return the y-coordinate below the final line."""
+
+    x, y = position
+    lines = _wrap_export_text(
+        draw,
+        text,
+        font,
+        max_width,
+    )
+
+    for line in lines:
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=fill,
+        )
+        bbox = draw.textbbox(
+            (x, y),
+            line,
+            font=font,
+        )
+        y = bbox[3] + line_spacing
+
+    return y
+
+
+def _build_explainability_png(
+    *,
+    model_input: np.ndarray,
+    heatmap_rgb: np.ndarray,
+    overlay: np.ndarray,
+    report: dict[str, object],
+    explanation: ExplainabilityResult,
+    created_at_utc: str,
+    opacity_percent: int,
+    threshold_percent: int,
+) -> bytes:
+    """Build a polished three-panel, explicitly non-diagnostic PNG export."""
+
+    canvas_width = 1800
+    canvas_height = 1160
+    margin = 70
+    gap = 34
+    panel_width = (
+        canvas_width
+        - (2 * margin)
+        - (2 * gap)
+    ) // 3
+    panel_top = 265
+    panel_height = 650
+    image_size = panel_width - 54
+
+    background = (2, 8, 20)
+    panel_background = (6, 24, 43)
+    panel_inner = (1, 10, 24)
+    cyan = (119, 233, 255)
+    blue = (72, 169, 255)
+    white = (238, 251, 255)
+    muted = (158, 190, 205)
+    warning_background = (33, 52, 46)
+    warning_border = (120, 170, 145)
+    warning_text = (233, 249, 239)
+
+    canvas = Image.new(
+        "RGB",
+        (canvas_width, canvas_height),
+        color=background,
+    )
+    draw = ImageDraw.Draw(canvas)
+
+    title_font = _load_export_font(48, bold=True)
+    subtitle_font = _load_export_font(25, bold=True)
+    body_font = _load_export_font(21)
+    small_font = _load_export_font(18)
+    panel_title_font = _load_export_font(27, bold=True)
+    badge_font = _load_export_font(20, bold=True)
+    warning_font = _load_export_font(20, bold=True)
+
+    # Header glow and framing.
+    draw.rounded_rectangle(
+        (35, 30, canvas_width - 35, 225),
+        radius=34,
+        fill=(4, 19, 36),
+        outline=(34, 114, 170),
+        width=2,
+    )
+    draw.ellipse(
+        (
+            canvas_width - 380,
+            -110,
+            canvas_width + 70,
+            340,
+        ),
+        outline=(40, 142, 214),
+        width=3,
+    )
+    draw.ellipse(
+        (
+            canvas_width - 320,
+            -50,
+            canvas_width + 10,
+            280,
+        ),
+        outline=(27, 88, 139),
+        width=2,
+    )
+
+    draw.rounded_rectangle(
+        (70, 72, 152, 154),
+        radius=20,
+        fill=(93, 210, 246),
+        outline=(217, 250, 255),
+        width=2,
+    )
+    logo_font = _load_export_font(25, bold=True)
+    draw.text(
+        (91, 96),
+        "RG",
+        font=logo_font,
+        fill=(2, 17, 31),
+    )
+
+    draw.text(
+        (180, 60),
+        "RadiantGuard AI",
+        font=title_font,
+        fill=white,
+    )
+    draw.text(
+        (182, 124),
+        "MODEL-INFLUENCE EXPLAINABILITY EXPORT",
+        font=subtitle_font,
+        fill=cyan,
+    )
+
+    label = _clean_label(explanation.label)
+    score_text = f"{explanation.research_score_percent}% research score"
+    draw.rounded_rectangle(
+        (1195, 72, 1718, 151),
+        radius=19,
+        fill=(8, 48, 78),
+        outline=(72, 169, 255),
+        width=2,
+    )
+    draw.text(
+        (1220, 88),
+        label,
+        font=badge_font,
+        fill=white,
+    )
+    draw.text(
+        (1220, 120),
+        score_text,
+        font=small_font,
+        fill=cyan,
+    )
+
+    analysis_id = str(report.get("analysis_id", "Unknown"))
+    model_info = report.get("model", {})
+    if not isinstance(model_info, dict):
+        model_info = {}
+
+    model_name = str(model_info.get("name", "Unknown model"))
+    model_version = str(model_info.get("version", "Unknown version"))
+    input_info = report.get("input", {})
+    if not isinstance(input_info, dict):
+        input_info = {}
+
+    source_label = str(
+        input_info.get(
+            "declared_image_source",
+            "Source not documented",
+        )
+    )
+
+    draw.text(
+        (72, 188),
+        f"Analysis ID: {analysis_id}",
+        font=small_font,
+        fill=muted,
+    )
+    draw.text(
+        (655, 188),
+        f"Generated: {created_at_utc}",
+        font=small_font,
+        fill=muted,
+    )
+
+    panel_data = (
+        (
+            "Model-space input",
+            "Exact 224 × 224 image received by the model",
+            model_input,
+        ),
+        (
+            "Blue influence map",
+            "Display-colored Grad-CAM values",
+            heatmap_rgb,
+        ),
+        (
+            "Adjustable overlay",
+            (
+                f"Glow {opacity_percent}% · "
+                f"suppression {threshold_percent}%"
+            ),
+            overlay,
+        ),
+    )
+
+    for index, (heading, caption, array) in enumerate(panel_data):
+        left = margin + index * (panel_width + gap)
+        right = left + panel_width
+        bottom = panel_top + panel_height
+
+        draw.rounded_rectangle(
+            (left, panel_top, right, bottom),
+            radius=28,
+            fill=panel_background,
+            outline=(32, 104, 153),
+            width=2,
+        )
+        draw.text(
+            (left + 27, panel_top + 25),
+            heading,
+            font=panel_title_font,
+            fill=white,
+        )
+
+        image_top = panel_top + 83
+        image_left = left + 27
+        image_right = image_left + image_size
+        image_bottom = image_top + image_size
+
+        draw.rounded_rectangle(
+            (
+                image_left - 5,
+                image_top - 5,
+                image_right + 5,
+                image_bottom + 5,
+            ),
+            radius=22,
+            fill=panel_inner,
+            outline=(43, 135, 190),
+            width=2,
+        )
+
+        image_array = np.asarray(array)
+
+        if image_array.ndim == 2:
+            panel_image = Image.fromarray(
+                image_array.astype(np.uint8),
+                mode="L",
+            ).convert("RGB")
+        else:
+            panel_image = Image.fromarray(
+                image_array.astype(np.uint8),
+                mode="RGB",
+            )
+
+        panel_image = panel_image.resize(
+            (image_size, image_size),
+            Image.Resampling.LANCZOS,
+        )
+
+        # Rounded image mask.
+        mask = Image.new(
+            "L",
+            (image_size, image_size),
+            color=0,
+        )
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.rounded_rectangle(
+            (0, 0, image_size - 1, image_size - 1),
+            radius=18,
+            fill=255,
+        )
+        canvas.paste(
+            panel_image,
+            (image_left, image_top),
+            mask,
+        )
+
+        _draw_wrapped_export_text(
+            draw,
+            position=(
+                left + 27,
+                image_bottom + 25,
+            ),
+            text=caption,
+            font=body_font,
+            fill=muted,
+            max_width=panel_width - 54,
+            line_spacing=6,
+        )
+
+    warning_top = 950
+    draw.rounded_rectangle(
+        (
+            margin,
+            warning_top,
+            canvas_width - margin,
+            canvas_height - 55,
+        ),
+        radius=24,
+        fill=warning_background,
+        outline=warning_border,
+        width=2,
+    )
+
+    warning = (
+        "MODEL-INFLUENCE MAP — NOT DISEASE LOCALIZATION. "
+        "Bright regions show what influenced this selected model output. "
+        "They do not confirm disease, anatomy, causality, clinical relevance, "
+        "or model correctness. Independent physician or radiologist review is required."
+    )
+    y_after_warning = _draw_wrapped_export_text(
+        draw,
+        position=(margin + 28, warning_top + 24),
+        text=warning,
+        font=warning_font,
+        fill=warning_text,
+        max_width=canvas_width - (2 * margin) - 56,
+        line_spacing=9,
+    )
+
+    footer = (
+        f"{model_name} · {model_version} · {explanation.method} · "
+        f"target layer {explanation.target_layer} · Source: {source_label}"
+    )
+    _draw_wrapped_export_text(
+        draw,
+        position=(margin + 28, y_after_warning + 2),
+        text=footer,
+        font=small_font,
+        fill=(177, 207, 219),
+        max_width=canvas_width - (2 * margin) - 56,
+        line_spacing=5,
+    )
+
+    output = BytesIO()
+    canvas.save(
+        output,
+        format="PNG",
+        optimize=True,
+    )
+    return output.getvalue()
+
 def _add_explainability_to_report(
     report: dict[str, object],
     record: dict[str, object] | None,
@@ -383,6 +807,15 @@ def _add_explainability_to_report(
         ],
         "heatmap_sha256": heatmap_digest,
         "heatmap_pixels_embedded": False,
+        "display_parameters": {
+            "overlay_glow_strength_percent": record.get(
+                "opacity_percent"
+            ),
+            "weaker_influence_suppression_percent": record.get(
+                "threshold_percent"
+            ),
+            "color_style": "RadiantGuard icy blue glow",
+        },
         "interpretation_boundary": (
             "The heatmap visualizes model influence in model space. "
             "It does not confirm disease location, anatomy, causality, "
@@ -519,6 +952,11 @@ def render_explainability_workspace(
             ),
         )
 
+    record["opacity_percent"] = opacity_percent
+    record["threshold_percent"] = threshold_percent
+    records[record_key] = record
+    st.session_state["gradcam_records"] = records
+
     model_input = _model_input_preview(
         np.asarray(study.display_image)
     )
@@ -585,6 +1023,39 @@ def render_explainability_workspace(
         "The model-space images above reflect center cropping and resizing. "
         "They are not full-resolution radiology images, and the highlighted "
         "region must not be interpreted as a confirmed abnormality."
+    )
+
+    export_png = _build_explainability_png(
+        model_input=model_input,
+        heatmap_rgb=heatmap_rgb,
+        overlay=overlay,
+        report=report,
+        explanation=explanation,
+        created_at_utc=str(record["created_at_utc"]),
+        opacity_percent=opacity_percent,
+        threshold_percent=threshold_percent,
+    )
+
+    st.download_button(
+        "Download three-panel explainability graphic (PNG)",
+        data=export_png,
+        file_name=(
+            f"{report['analysis_id']}_"
+            f"{explanation.label.replace('_', '-')}_gradcam.png"
+        ),
+        mime="image/png",
+        key=f"gradcam_png_{record_key}",
+        help=(
+            "Downloads a labeled three-panel research graphic with the "
+            "analysis ID, model version, visualization settings, and "
+            "non-diagnostic warning printed directly on the image."
+        ),
+    )
+
+    st.caption(
+        "The PNG contains the 224 × 224 model-space input and derived "
+        "visualizations. It must not be placed in a medical record or "
+        "used for diagnosis or treatment."
     )
 
     with st.expander(
