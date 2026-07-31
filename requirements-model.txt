@@ -1,0 +1,6 @@
+# Phase 2 research-model dependencies. Install only after selecting and documenting
+# the exact public model, weights, license, preprocessing, and validation scope.
+-r requirements.txt
+torch>=2.7,<3.0
+torchvision>=0.22,<1.0
+monai>=1.5,<2.0
