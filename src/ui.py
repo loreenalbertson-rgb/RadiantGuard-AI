@@ -452,6 +452,142 @@ label,
     box-shadow: none;
 }
 
+
+/* Streamlit 1.60 button visibility override.
+   Keep all button labels readable in normal, hover, focus, active,
+   and disabled states—even when Streamlit's generated styles change. */
+div.stButton > button,
+div.stDownloadButton > button,
+[data-testid="stBaseButton-primary"],
+[data-testid="stBaseButton-secondary"],
+[data-testid="stBaseButton-tertiary"],
+[data-testid="stDownloadButton"] button,
+[data-testid="stFileUploaderDropzone"] button {
+    min-height: 2.8rem !important;
+    border: 1px solid rgba(119, 233, 255, 0.34) !important;
+    border-radius: 13px !important;
+    color: #effcff !important;
+    -webkit-text-fill-color: #effcff !important;
+    background: linear-gradient(135deg, #0d568e, #1387c5) !important;
+    box-shadow:
+        0 0 18px rgba(72, 169, 255, 0.20),
+        inset 0 0 12px rgba(255, 255, 255, 0.05) !important;
+    opacity: 1 !important;
+}
+
+div.stButton > button *,
+div.stDownloadButton > button *,
+[data-testid="stBaseButton-primary"] *,
+[data-testid="stBaseButton-secondary"] *,
+[data-testid="stBaseButton-tertiary"] *,
+[data-testid="stDownloadButton"] button *,
+[data-testid="stFileUploaderDropzone"] button * {
+    color: #effcff !important;
+    -webkit-text-fill-color: #effcff !important;
+    opacity: 1 !important;
+}
+
+div.stButton > button:hover,
+div.stDownloadButton > button:hover,
+[data-testid="stBaseButton-primary"]:hover,
+[data-testid="stBaseButton-secondary"]:hover,
+[data-testid="stBaseButton-tertiary"]:hover,
+[data-testid="stDownloadButton"] button:hover,
+[data-testid="stFileUploaderDropzone"] button:hover {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    border-color: rgba(217, 247, 255, 0.72) !important;
+    background: linear-gradient(135deg, #1474b7, #1ba7db) !important;
+    box-shadow:
+        0 0 30px rgba(72, 169, 255, 0.38),
+        0 8px 24px rgba(0, 0, 0, 0.30) !important;
+    transform: translateY(-1px);
+}
+
+div.stButton > button:hover *,
+div.stDownloadButton > button:hover *,
+[data-testid="stBaseButton-primary"]:hover *,
+[data-testid="stBaseButton-secondary"]:hover *,
+[data-testid="stBaseButton-tertiary"]:hover *,
+[data-testid="stDownloadButton"] button:hover *,
+[data-testid="stFileUploaderDropzone"] button:hover * {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+}
+
+div.stButton > button:focus,
+div.stButton > button:focus-visible,
+div.stDownloadButton > button:focus,
+div.stDownloadButton > button:focus-visible,
+[data-testid="stBaseButton-primary"]:focus,
+[data-testid="stBaseButton-secondary"]:focus,
+[data-testid="stBaseButton-tertiary"]:focus,
+[data-testid="stDownloadButton"] button:focus,
+[data-testid="stFileUploaderDropzone"] button:focus {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    outline: 2px solid rgba(119, 233, 255, 0.78) !important;
+    outline-offset: 2px !important;
+    box-shadow:
+        0 0 0 4px rgba(72, 169, 255, 0.18),
+        0 0 26px rgba(72, 169, 255, 0.30) !important;
+}
+
+div.stButton > button:active,
+div.stDownloadButton > button:active,
+[data-testid="stBaseButton-primary"]:active,
+[data-testid="stBaseButton-secondary"]:active,
+[data-testid="stBaseButton-tertiary"]:active,
+[data-testid="stDownloadButton"] button:active,
+[data-testid="stFileUploaderDropzone"] button:active {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    background: linear-gradient(135deg, #0b4a7b, #0f78ad) !important;
+    transform: translateY(0);
+}
+
+div.stButton > button:disabled,
+div.stDownloadButton > button:disabled,
+[data-testid="stBaseButton-primary"]:disabled,
+[data-testid="stBaseButton-secondary"]:disabled,
+[data-testid="stBaseButton-tertiary"]:disabled,
+[data-testid="stDownloadButton"] button:disabled,
+[data-testid="stFileUploaderDropzone"] button:disabled {
+    color: #b8cfda !important;
+    -webkit-text-fill-color: #b8cfda !important;
+    border-color: rgba(126, 211, 255, 0.12) !important;
+    background: rgba(24, 50, 72, 0.88) !important;
+    box-shadow: none !important;
+    opacity: 0.72 !important;
+    cursor: not-allowed !important;
+}
+
+div.stButton > button:disabled *,
+div.stDownloadButton > button:disabled *,
+[data-testid="stBaseButton-primary"]:disabled *,
+[data-testid="stBaseButton-secondary"]:disabled *,
+[data-testid="stBaseButton-tertiary"]:disabled *,
+[data-testid="stDownloadButton"] button:disabled *,
+[data-testid="stFileUploaderDropzone"] button:disabled * {
+    color: #b8cfda !important;
+    -webkit-text-fill-color: #b8cfda !important;
+}
+
+/* Keep link-style and toolbar buttons visible against the dark interface. */
+button[aria-label],
+[data-testid="stToolbar"] button,
+[data-testid="stHeader"] button {
+    color: #dff8ff !important;
+    -webkit-text-fill-color: #dff8ff !important;
+}
+
+button[aria-label] svg,
+[data-testid="stToolbar"] button svg,
+[data-testid="stHeader"] button svg {
+    fill: currentColor !important;
+    color: #dff8ff !important;
+}
+
 [data-baseweb="select"] > div,
 [data-baseweb="input"] > div,
 [data-baseweb="textarea"] {
