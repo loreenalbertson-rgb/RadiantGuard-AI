@@ -2,3 +2,8 @@ streamlit>=1.50,<2.0
 numpy>=2.0,<3.0
 Pillow>=11.0,<13.0
 pydicom>=3.0,<4.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.7.1+cpu
+torchvision==0.22.1+cpu
+torchxrayvision==1.5.2
